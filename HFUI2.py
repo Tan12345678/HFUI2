@@ -7,6 +7,7 @@ import json
 import time
 from pathlib import Path
 from textwrap import shorten
+from datetime import datetime
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -33,6 +34,46 @@ STATE_FILE = DATA_DIR / "conversations.json"
 NOTES_FILE = DATA_DIR / "notes.json"
 MEM_FILE = DATA_DIR / "memory.json"
 
+# === Local usage tracking (HF + RAG) ===
+DEFAULT_COST_PER_REQ = 0.01 / 38  # ~ $0.000263 based on your snapshot
+COST_PER_REQ = float(os.getenv("HF_COST_PER_REQ", DEFAULT_COST_PER_REQ))
+FREE_CAP = float(os.getenv("HF_FREE_CAP", 0.10))  # HF free monthly cap in USD
+
+USAGE_FILE = DATA_DIR / "usage.json"
+
+def _load_usage():
+    if USAGE_FILE.exists():
+        try:
+            u = json.loads(USAGE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            u = {}
+    else:
+        u = {}
+    month = datetime.utcnow().strftime("%Y-%m")
+    u.setdefault("month", month)
+    if u["month"] != month:
+        u = {"month": month, "dollars": 0.0, "requests": 0, "rag_calls": 0, "rag_results": 0}
+    u.setdefault("dollars", 0.0)
+    u.setdefault("requests", 0)
+    u.setdefault("rag_calls", 0)
+    u.setdefault("rag_results", 0)
+    return u
+
+def _save_usage(u):
+    USAGE_FILE.write_text(json.dumps(u, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def add_inference_usage(u, cost=COST_PER_REQ):
+    u["requests"] += 1
+    u["dollars"] = round(u["dollars"] + float(cost), 6)
+    _save_usage(u)
+
+def add_rag_usage(u, results_count):
+    u["rag_calls"] += 1
+    u["rag_results"] += int(results_count)
+    _save_usage(u)
+
+usage = _load_usage()
+
 st.set_page_config(page_title="HF Chat", page_icon="🤖", layout="wide")
 
 # ============ Styles ============
@@ -40,16 +81,41 @@ st.markdown("""
 <style>
 section.main > div { padding-top: 0rem; }
 .block-container { padding-top: 1rem; padding-bottom: 1rem; }
+
 .chat-bubble {
   border-radius: 18px;
   padding: 12px 14px;
   margin: 6px 0;
   line-height: 1.5;
   box-shadow: 0 2px 10px rgba(0,0,0,0.06);
-  border: 1px solid rgba(0,0,0,0.05);
+  border: 1px solid var(--bubble-border);
+  background: var(--bubble-bg);
+  color: var(--bubble-fg);
 }
-.user-bubble { background: #f6f7f9; }
-.assistant-bubble { background: #ffffff; }
+
+/* Light default */
+:root {
+  --bubble-bg: #ffffff;
+  --bubble-fg: #111111;
+  --bubble-border: rgba(0,0,0,0.06);
+  --bubble-user-bg: #f6f7f9;
+  --link-color: #0a58ca;
+}
+
+/* Respect OS / Streamlit dark mode */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bubble-bg: #1f2227;
+    --bubble-fg: #e8eaed;
+    --bubble-border: rgba(255,255,255,0.10);
+    --bubble-user-bg: #2a2e35;
+    --link-color: #8ab4f8;
+  }
+}
+.user-bubble { background: var(--bubble-user-bg); }
+.assistant-bubble { background: var(--bubble-bg); }
+
+a, .stMarkdown a { color: var(--link-color) !important; text-decoration: underline; }
 .sidebar .sidebar-content { padding-top: 1rem; }
 </style>
 """, unsafe_allow_html=True)
@@ -138,6 +204,13 @@ def web_research(query: str, max_results: int = 4):
             sources.append({"title": title, "url": url})
         if len(snippets) >= max_results:
             break
+
+    # track RAG usage locally
+    try:
+        add_rag_usage(usage, results_count=len(snippets))
+    except Exception:
+        pass
+
     return snippets, sources
 
 def build_history_block(chat_obj, max_turns=8):
@@ -212,6 +285,24 @@ llm = HuggingFaceEndpoint(
     temperature=0.7,
 )
 chat_model = ChatHuggingFace(llm=llm)
+
+# === Usage panel (local estimate) ===
+st.sidebar.markdown("---")
+st.sidebar.header("📊 Usage (local)")
+used = usage["dollars"]
+cap = FREE_CAP if FREE_CAP > 0 else 0.10
+st.sidebar.progress(min(used / cap, 1.0))
+colA, colB, colC = st.sidebar.columns(3)
+colA.metric("HF $ used", f"${used:.4f}")
+colB.metric("HF requests", f"{usage['requests']}")
+colC.metric("RAG calls", f"{usage['rag_calls']}")
+
+with st.sidebar.expander("Usage settings"):
+    st.caption("Local estimate based on COST_PER_REQ and your history. Set env vars HF_COST_PER_REQ / HF_FREE_CAP to override.")
+    new_cpr = st.number_input("Cost per request ($)", value=float(COST_PER_REQ), step=0.0001, format="%.6f")
+    if new_cpr != COST_PER_REQ:
+        COST_PER_REQ = float(new_cpr)
+    warn_at = st.slider("Warn at % of free cap", 50, 100, 90, step=5)
 
 # ============ Sidebar: Chats ============
 st.sidebar.markdown("---")
@@ -443,12 +534,39 @@ if prompt := st.chat_input("Type your message…"):
     else:
         model_input = build_plain_prompt_from_history(prompt, memory_preface, history_block)
 
+    # Soft cap guard before sending paid inference (local estimate)
+    soft_cap = (locals().get("warn_at", 90) / 100.0) * FREE_CAP
+    can_send = True
+    if usage["dollars"] + COST_PER_REQ >= soft_cap:
+        with st.chat_message("assistant"):
+            st.warning(
+                f"Approaching free cap. Estimated after this call: ${usage['dollars'] + COST_PER_REQ:.4f} "
+                f"of ${FREE_CAP:.2f}."
+            )
+            can_send = st.toggle("Force send anyway", value=False)
+    if not can_send:
+        # Save assistant warning as a message and skip the call
+        active_chat["messages"].append({
+            "role": "assistant",
+            "content": "⏸️ Skipped model call to avoid exceeding the free cap (local estimate). Toggle 'Force send anyway' to proceed."
+        })
+        auto_rename_chat(active_chat)
+        _write_json(STATE_FILE, st.session_state.conversations)
+        _write_json(NOTES_FILE, st.session_state.notes)
+        _write_json(MEM_FILE, st.session_state.memory)
+        st.stop()
+
     # Assistant response
     with st.chat_message("assistant"):
         ph = st.empty()
         try:
             resp = chat_model.invoke(model_input)
             answer = resp.content
+            # record local inference usage
+            try:
+                add_inference_usage(usage, cost=COST_PER_REQ)
+            except Exception:
+                pass
         except Exception as e:
             answer = f"⚠️ Error: {e}"
 
@@ -463,7 +581,8 @@ if prompt := st.chat_input("Type your message…"):
     if citations:
         with st.expander("🔗 Sources"):
             for i, c in enumerate(citations, 1):
-                st.markdown(f"[{i}] {c['title']}]({c['url']})")
+                # fix bracket so link renders correctly
+                st.markdown(f"[{i}] {c['title']} ({c['url']})")
 
     # Auto-rename & persist
     auto_rename_chat(active_chat)
