@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+
+# Virtual envs
+.env
+.venv
+venv/
+ENV/
+
+# Streamlit & app data
+chat_data/
+*.tmp
+*.pdf
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+.DS_Store
